@@ -58,6 +58,8 @@ def main():
             time.sleep(5)
         res["status"] = "stopped"
         res["stopped_utc"] = now()
+        if isinstance(res.get("instance"), dict):
+            res["instance"]["state"] = "stopped"  # keep the record consistent with the real state
         save(res, res_path)
         print(f"STOPPED and verified: {iid} is stopped  {now()}")
         return
@@ -88,7 +90,17 @@ def main():
     print(f"[terminated] {iid}  {now()}")
 
     # --- read back: five items no longer exist ---
-    inst_gone = missing_ok(lambda: aw(["ec2", "describe-instances", "--instance-ids", iid]))
+    # AWS keeps a recently-terminated instance readable (State=terminated) for a
+    # while; treat 'terminated' as not-existing in addition to a NotFound error.
+    def instance_gone(iid):
+        try:
+            st = aw(["ec2", "describe-instances", "--instance-ids", iid,
+                     "--query", "Reservations[0].Instances[0].State.Name"])
+            return st == "terminated"
+        except lab.LabError as exc:
+            return "NotFound" in str(exc)
+
+    inst_gone = instance_gone(iid)
     vol_gone = missing_ok(lambda: aw(["ec2", "describe-volumes", "--volume-ids", res["volume"]["id"]]))
     eni_gone = missing_ok(lambda: aw(["ec2", "describe-network-interfaces",
                                       "--network-interface-ids", res["eni"]["id"]]))
