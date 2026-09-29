@@ -1,0 +1,7 @@
+{
+  "event_id": "Group8 1-0003",
+  "device_id": "Group8-d01",
+  "observed_at": "2026-09-29T10:00:00+08:00",
+  "type": "test",
+  "note": "event_id 中間有空格，應回 400 且 field=event_id"
+}

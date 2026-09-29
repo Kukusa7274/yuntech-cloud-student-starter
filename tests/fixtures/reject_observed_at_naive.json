@@ -1,0 +1,7 @@
+{
+  "event_id": "Group8-1-0002",
+  "device_id": "Group8-d01",
+  "observed_at": "2026-09-29T10:00:00",
+  "type": "anomaly",
+  "note": "缺少時區資訊，應回 400 且 field=observed_at"
+}
