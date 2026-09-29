@@ -4,6 +4,7 @@ Every event-shaped request is built from a file in tests/fixtures/ on purpose:
 if the test suite stops reading those files it is no longer checking the
 student's fixtures. `test_fixtures_are_actually_read` enforces that.
 """
+import importlib
 import importlib.util
 import json
 import os
@@ -286,6 +287,66 @@ class ProductionEntryPoint(unittest.TestCase):
         finally:
             child.terminate()
             child.wait(timeout=5)
+
+
+class DeployCommandQuoting(unittest.TestCase):
+    """ssh concatenates its argv and the REMOTE shell re-parses the result.
+
+    An unquoted fragment such as "a && b" arrives as `sh -c a && b`, so `b` runs
+    outside the privileged shell as the unprivileged login user. That is how the
+    first deploy attempt failed: mkdir ran as ec2-user and the token file never
+    landed, while the script reported the install as successful.
+    """
+
+    def _what_the_remote_shell_would_run(self, fragment, quote=True):
+        import os
+        import subprocess
+        import tempfile
+        sys.path.insert(0, str(ROOT / "deploy"))
+        deploy = importlib.import_module("deploy_aws")
+        joined = " ".join(["sudo", "sh", "-c", deploy.shq(fragment) if quote else fragment])
+        with tempfile.TemporaryDirectory() as td:
+            # The outer shell opens `cat > ...` before running anything, so the
+            # target directory has to exist or the probe fails for the wrong reason.
+            for part in fragment.replace("&&", " ").split():
+                if part.startswith("/"):
+                    Path(part).parent.mkdir(parents=True, exist_ok=True)
+            # Stub every command the fragment names, so the unquoted variant -- which
+            # really does run mkdir/cat in the OUTER shell -- has no side effects and
+            # its structure can be inspected instead of blowing up on /etc.
+            for name in ("sudo", "mkdir", "cat"):
+                stub = Path(td) / name
+                stub.write_text(f'#!/bin/sh\nprintf "{name}"; for a in "$@"; do printf " [%s]" "$a"; done\n'
+                                'printf "\\n"\n', encoding="utf-8")
+                stub.chmod(0o755)
+            env = dict(os.environ, PATH=td + os.pathsep + os.environ["PATH"])
+            done = subprocess.run(["sh", "-c", joined], capture_output=True, text=True, env=env)
+            redirected = any(Path(part).exists()
+                             for part in fragment.replace("&&", " ").split()
+                             if part.startswith("/") and not Path(part).is_dir())
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return done.stdout.strip().splitlines(), redirected
+
+    def _fragment(self, tmp):
+        return f"umask 077 && mkdir -p {tmp}/inspection && cat > {tmp}/inspection/app.env"
+
+    def test_quoted_fragment_arrives_as_one_argument(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            received, redirected = self._what_the_remote_shell_would_run(self._fragment(tmp))
+        self.assertEqual(len(received), 1, received)
+        self.assertTrue(received[0].startswith("sudo [sh] [-c] ["), received)
+        self.assertIn(f"cat > {tmp}/inspection/app.env", received[0])
+        self.assertFalse(redirected, "quoted form still let the outer shell redirect")
+
+    def test_the_unquoted_form_escapes_the_privileged_shell(self):
+        # Guards against shq() being removed as "unnecessary". Without the quoting
+        # the outer shell runs mkdir and cat itself, as the unprivileged user.
+        with tempfile.TemporaryDirectory() as tmp:
+            received, redirected = self._what_the_remote_shell_would_run(self._fragment(tmp),
+                                                                        quote=False)
+        self.assertGreater(len(received), 1, "unquoted form no longer escapes; revisit shq()")
+        self.assertTrue(any(line.startswith("mkdir ") for line in received), received)
+        self.assertTrue(redirected, "the outer shell performed the redirect itself")
 
 
 class FixturesAreRealInputs(ServiceBase):

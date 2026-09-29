@@ -46,6 +46,17 @@ def save(res, path):
     os.replace(tmp, path)
 
 
+def shq(text):
+    """Quote one shell fragment for the remote login shell.
+
+    ssh concatenates its argv with spaces and the REMOTE shell re-parses the
+    result, so `["sh", "-c", "a && b"]` arrives as `sh -c a && b` and the `&&`
+    then runs OUTSIDE sh, as the unprivileged login user. Wrapping the fragment
+    keeps the redirection inside the privileged shell.
+    """
+    return "'" + text.replace("'", "'\\''") + "'"
+
+
 def ssh_run(argv, key, ip, stdin_file=None, timeout=300):
     """Run one command on the host. stdin_file is piped, never named in argv."""
     command = ["ssh", "-i", key,
@@ -107,9 +118,8 @@ def main():
     print(f"[installed] committed build in place  {now()}")
 
     # --- 2) push the token file on stdin; umask 077 makes it 600 before it is ever written ---
-    result = ssh_run(["sudo", "sh", "-c",
-                      f"umask 077 && mkdir -p {os.path.dirname(REMOTE_SECRET)} && cat > {REMOTE_SECRET}"],
-                     key, ip, stdin_file=secret)
+    push = shq(f"umask 077 && mkdir -p {os.path.dirname(REMOTE_SECRET)} && cat > {REMOTE_SECRET}")
+    result = ssh_run(["sudo", "sh", "-c", push], key, ip, stdin_file=secret)
     if result.returncode:
         print("STOP: could not place the token file. Nothing is printed about its contents.")
         print("stderr tail:", (result.stderr or "")[-200:])

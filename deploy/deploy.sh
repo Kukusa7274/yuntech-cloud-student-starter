@@ -31,6 +31,14 @@ COMMIT="HEAD"
 if [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; then COMMIT="$1"; shift; fi
 
 # ---------- pre-flight: refuse to start on a bad state instead of patching it ----------
+if [ "$(id -u)" = "0" ]; then
+  echo "STOP: do not run this with sudo."
+  echo "      sudo changes \$HOME to /root, so the script would look for the SSH key and"
+  echo "      the learnerlab AWS profile in the wrong place -- and it would run lab.py as root."
+  echo "      Re-run as your normal user:  bash deploy/deploy.sh ${COMMIT}"
+  exit 1
+fi
+
 [ -f "$RES" ]   || { echo "STOP: missing $RES -- no recorded host to deploy to."; exit 1; }
 [ -f "$KEY" ]   || { echo "STOP: missing SSH private key $KEY (private key is never read or printed by the agent)."; exit 1; }
 if [ ! -f "$SECRET" ]; then
