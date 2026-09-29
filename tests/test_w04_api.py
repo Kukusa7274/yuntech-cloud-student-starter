@@ -245,11 +245,16 @@ class ProductionEntryPoint(unittest.TestCase):
         import time
         import urllib.request
 
+        # Mirror the server: ThreadingHTTPServer sets allow_reuse_address, so a
+        # port left in TIME_WAIT by a previous run is still bindable. Without this
+        # the probe would wrongly report "busy" and silently skip the one test
+        # that covers the production start-up path.
         probe = socket.socket()
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             probe.bind(("127.0.0.1", 8080))
         except OSError:
-            self.skipTest("port 8080 is busy in this environment")
+            self.skipTest("port 8080 is genuinely busy in this environment")
         finally:
             probe.close()
 
