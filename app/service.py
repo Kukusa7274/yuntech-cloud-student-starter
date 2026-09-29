@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hmac
 import json
+import os
 from pathlib import Path
 import re
 import threading
@@ -234,5 +235,18 @@ def make_server(version_file, port=8080, tokens=None):
     return ThreadingHTTPServer(("127.0.0.1", port), Handler)
 
 
+def tokens_from_environment(environ=None):
+    """Read the two tokens systemd injects from /etc/inspection/app.env.
+
+    This is the ONLY place that touches the environment. make_server() takes the
+    tokens as a parameter, so offline tests need no environment at all and the
+    dependency stays injectable.
+    """
+    env = os.environ if environ is None else environ
+    return {"reporter": env.get("REPORTER_TOKEN", ""),
+            "operator": env.get("OPERATOR_TOKEN", "")}
+
+
 if __name__ == "__main__":
-    make_server(Path(__file__).with_name("version")).serve_forever()
+    make_server(Path(__file__).with_name("version"),
+                tokens=tokens_from_environment()).serve_forever()

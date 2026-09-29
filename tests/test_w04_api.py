@@ -6,7 +6,9 @@ student's fixtures. `test_fixtures_are_actually_read` enforces that.
 """
 import importlib.util
 import json
+import os
 from pathlib import Path
+import sys
 import tempfile
 import threading
 import unittest
@@ -220,6 +222,65 @@ class HealthAndPage(ServiceBase):
         for banned in ("innerHTML", "localStorage", "sessionStorage", "?token=", "document.write"):
             self.assertNotIn(banned, html)
         self.assertIn("textContent", html)
+
+
+class ProductionEntryPoint(unittest.TestCase):
+    """Every other test calls make_server() directly, which is NOT how the host
+    starts the service: on the box systemd runs `python3 app/service.py`, and the
+    tokens arrive through EnvironmentFile. A suite that never exercises that path
+    passes while the deployed service answers 401 to everything."""
+
+    def test_tokens_are_read_from_the_systemd_environment(self):
+        self.assertEqual(
+            service.tokens_from_environment({"REPORTER_TOKEN": "r", "OPERATOR_TOKEN": "o"}),
+            {"reporter": "r", "operator": "o"})
+        self.assertEqual(service.tokens_from_environment({}),
+                         {"reporter": "", "operator": ""})
+
+    def test_running_the_module_wires_the_environment_into_the_server(self):
+        import shutil
+        import socket
+        import subprocess
+        import tempfile
+        import time
+        import urllib.request
+
+        probe = socket.socket()
+        try:
+            probe.bind(("127.0.0.1", 8080))
+        except OSError:
+            self.skipTest("port 8080 is busy in this environment")
+        finally:
+            probe.close()
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        app = Path(tmp.name) / "app"
+        app.mkdir()
+        shutil.copy(ROOT / "app/service.py", app / "service.py")
+        (app / "version").write_text("d" * 40 + "\n")
+
+        environ = {"PATH": os.environ["PATH"], "REPORTER_TOKEN": "r-from-env",
+                   "OPERATOR_TOKEN": "o-from-env"}
+        child = subprocess.Popen([sys.executable, str(app / "service.py")], env=environ,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(child.wait)
+        self.addCleanup(child.terminate)
+        try:
+            body = None
+            for _ in range(40):
+                try:
+                    with urllib.request.urlopen("http://127.0.0.1:8080/health", timeout=2) as response:
+                        body = json.load(response)
+                    break
+                except OSError:
+                    time.sleep(0.25)
+            self.assertIsNotNone(body, "service.py did not answer /health when run as __main__")
+            self.assertIs(body["auth_configured"], True)
+            self.assertEqual(body["version"], "d" * 40)
+        finally:
+            child.terminate()
+            child.wait(timeout=5)
 
 
 class FixturesAreRealInputs(ServiceBase):
