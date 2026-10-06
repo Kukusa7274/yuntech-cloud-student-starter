@@ -1,19 +1,42 @@
 #!/usr/bin/env python3
-"""W4 inspection service: authenticated event intake over a deliberately
-in-memory store. A service restart drops every event; W5 makes it durable.
+"""W5 inspection service: authenticated event intake over a private PostgreSQL
+database, so a restart no longer loses events and a repeated delivery no longer
+creates a second row.
 
-The order of the checks in do_POST / do_GET is load-bearing:
-    401 (who are you) -> 403 (may you) -> 400 (is it valid) -> 409 -> 201
+W4 kept events in a dict inside the process. W5 replaces that with the database,
+but only when the database secret is actually present. Two stores therefore
+exist, and /health says which one is live:
+
+    PostgresStore  DB_* is set        -> durable, survives a restart
+    MemoryStore    DB_* is missing    -> W4 behaviour, events die with the process
+
+The fallback exists because the W5 brief requires the service to keep starting
+and reporting 200 when the secret has not reached the host yet (rebuilding a
+broken host with up.sh must still pass /health). It is a DEGRADED mode, not an
+equivalent one: it keeps the W4 duplicate rule (any repeat is 409) and it loses
+events on restart. deploy_aws.py therefore treats db_configured=false after a
+successful deployment as a failure rather than a success.
+
+Idempotency is decided by the database, never by a SELECT-then-INSERT in this
+process. The insert is attempted unconditionally and the primary key decides;
+only AFTER the insert is refused does the service read the stored row back, and
+then only to choose between 200 and 409. Two requests arriving at the same
+microsecond both attempt the insert, and exactly one wins.
+
+The order of the checks in do_POST / do_GET is still load-bearing:
+    401 (who are you) -> 403 (may you) -> 400 (is it valid) -> 409/200 -> 201
 A caller with no valid token must not learn the field rules from the reply, so
 authentication is decided before the body is even looked at.
 """
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import contextlib
 import hmac
 import json
 import os
 from pathlib import Path
 import re
+import sys
 import threading
 
 MAX_BODY_BYTES = 4 * 1024
@@ -23,6 +46,39 @@ REQUIRED_FIELDS = ("event_id", "device_id", "observed_at", "type")
 EVENT_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 DEVICE_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,32}")
 LIST_LIMIT = 50
+DB_CA_FILE = "/etc/inspection/rds-ca.pem"
+DB_CONNECT_TIMEOUT = 5
+POOL_MIN = 1
+POOL_MAX = 4
+
+# One statement. event_id is the primary key, so the conflict target is the key
+# itself and DO NOTHING never overwrites a row. RETURNING tells us whether this
+# call was the one that created it -- there is no separate "did it exist?" query
+# racing the write.
+INSERT_SQL = (
+    "INSERT INTO events (event_id, device_id, observed_at, type, note) "
+    "VALUES (%s, %s, %s, %s, %s) "
+    "ON CONFLICT (event_id) DO NOTHING "
+    "RETURNING received_at"
+)
+SELECT_BY_ID_SQL = (
+    "SELECT device_id, observed_at, type, note, received_at "
+    "FROM events WHERE event_id = %s"
+)
+RECENT_SQL = (
+    "SELECT event_id, device_id, observed_at, type, note, received_at "
+    "FROM events ORDER BY received_at DESC, event_id DESC LIMIT %s"
+)
+CREATE_SQL = """
+CREATE TABLE IF NOT EXISTS events (
+    event_id    text PRIMARY KEY,
+    device_id   text NOT NULL,
+    observed_at timestamptz NOT NULL,
+    type        text NOT NULL,
+    note        text,
+    received_at timestamptz NOT NULL DEFAULT now()
+)
+"""
 
 DISPLAY_PAGE = """<!doctype html>
 <html lang="zh-Hant">
@@ -60,7 +116,7 @@ class Rejected(Exception):
     """A refusal that already carries its status code and a safe message.
 
     Only `error` and `field` ever reach the client: never a token, never the
-    submitted body.
+    submitted body, never a database connection string.
     """
 
     def __init__(self, status, error, field=None):
@@ -70,14 +126,308 @@ class Rejected(Exception):
         self.field = field
 
 
-class Store:
-    """W4 is intentionally process-local; see the module docstring."""
+class DatabaseProblem(Exception):
+    """The database could not serve this request.
+
+    Carries a CATEGORY only. The driver's message can contain the connection
+    string (which embeds the password), so it is logged as a type name and a
+    category and never as text.
+    """
+
+    def __init__(self, category, exception=None):
+        super().__init__(category)
+        self.category = category
+        self.exception = exception
+
+
+def classify_database_error(exc):
+    """Map a driver exception to a diagnostic category.
+
+    The W5 troubleshooting table asks for exactly this classification:
+    timeout (security group / routing), wrong password (secret file),
+    certificate verification failure (CA file / hostname), SQL error (program).
+    """
+    text = str(exc).lower()
+    if "certificate verify failed" in text or "certificate verify" in text:
+        return "tls_verification_failed"
+    if "password authentication failed" in text or "authentication failed" in text:
+        return "db_authentication_failed"
+    if "sslrootcert" in text or "sslmode" in text or "no ssl connection" in text:
+        return "tls_configuration_error"
+    if isinstance(exc, TimeoutError) or "timeout" in text or "timed out" in text:
+        return "db_unreachable_timeout"
+    if "could not connect" in text or "connection refused" in text or "no route to host" in text:
+        return "db_unreachable"
+    if "no pg_hba.conf entry" in text:
+        return "db_unreachable"
+    return "database_error"
+
+
+def note_database_problem(problem):
+    """Write a diagnosable line to the journal -- and nothing else.
+
+    systemd sends stderr to journalctl, which is where the W5 troubleshooting
+    section sends you. The category and the exception TYPE are enough to tell
+    the four cases apart; the exception message is deliberately dropped because
+    psycopg2 puts the DSN, and therefore the password, into some of them.
+    """
+    kind = type(problem.exception).__name__ if problem.exception is not None else "None"
+    print(f"db-error category={problem.category} driver={kind}", file=sys.stderr, flush=True)
+
+
+def iso(moment):
+    """Render an aware datetime the way the W4 contract rendered it."""
+    if moment is None:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def as_utc(moment):
+    if moment.tzinfo is None:
+        return moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc)
+
+
+class MemoryStore:
+    """W4 behaviour, kept for the case where the database secret is absent.
+
+    Deliberately NOT durable and deliberately NOT the W5 duplicate rule: a
+    repeat here is 409 whatever the content, because that is the W4 contract the
+    offline suite checks. /health exposes this state as db_configured=false so a
+    deployment that forgot the secret is visible instead of silent.
+    """
+
+    kind = "memory"
 
     def __init__(self, tokens):
         self.tokens = {role: value or "" for role, value in (tokens or {}).items()}
         self.auth_configured = all(self.tokens.get(role) for role in ("reporter", "operator"))
         self.events = {}
         self.lock = threading.Lock()
+
+    def insert(self, body):
+        """-> (outcome, payload). outcome is created / same / conflict."""
+        with self.lock:
+            if body["event_id"] in self.events:
+                return "conflict", None
+            event = dict(body)
+            event["received_at"] = datetime.now(timezone.utc).isoformat(
+                timespec="seconds").replace("+00:00", "Z")
+            self.events[body["event_id"]] = event
+        return "created", event
+
+    def recent(self, limit):
+        with self.lock:
+            return list(self.events.values())[-limit:]
+
+    def get(self, event_id):
+        with self.lock:
+            return self.events.get(event_id)
+
+
+class PostgresStore:
+    """Durable store. Every SQL statement is parameterised.
+
+    The connection parameters are assembled once and never formatted into a
+    string: psycopg2 takes them as keyword arguments, so the password never
+    passes through a log line, a traceback repr or a str() of the config.
+    """
+
+    kind = "postgres"
+
+    def __init__(self, config, tokens):
+        self.config = dict(config)
+        self.tokens = {role: value or "" for role, value in (tokens or {}).items()}
+        self.auth_configured = all(self.tokens.get(role) for role in ("reporter", "operator"))
+        self._pool = None
+        self._pool_lock = threading.Lock()
+
+    def _connection_kwargs(self):
+        return {
+            "host": self.config["host"],
+            "port": self.config["port"],
+            "dbname": self.config["dbname"],
+            "user": self.config["user"],
+            "password": self.config["password"],
+            # verify-full encrypts AND checks that the peer really is the RDS
+            # instance named in the certificate. Turning this off would make the
+            # database reachable by anything that could answer on that address.
+            "sslmode": "verify-full",
+            "sslrootcert": self.config["ca_file"],
+            "connect_timeout": DB_CONNECT_TIMEOUT,
+        }
+
+    def _ensure_pool(self):
+        pool = self._pool
+        if pool is not None:
+            return pool
+        with self._pool_lock:
+            # Re-check inside the lock: two request threads can arrive together.
+            if self._pool is None:
+                self._pool = self._create_pool()
+            return self._pool
+
+    def _create_pool(self):
+        """Build the pool, then make sure the table exists.
+
+        Kept separate from _ensure_pool so initialising the schema borrows a
+        connection from the finished pool instead of re-entering the lazily
+        initialising getter (that would deadlock on a non-reentrant lock).
+        """
+        try:
+            # Imported here, not at module scope: the offline suite and a host
+            # without the driver must still be able to import this file and run
+            # the memory store.
+            import psycopg2
+            from psycopg2 import pool as pg_pool
+        except ImportError as exc:
+            raise DatabaseProblem("driver_missing", exc)
+        try:
+            pool = pg_pool.ThreadedConnectionPool(POOL_MIN, POOL_MAX,
+                                                  **self._connection_kwargs())
+        except Exception as exc:                 # the driver raises several types
+            raise DatabaseProblem(classify_database_error(exc), exc)
+        try:
+            with self._borrow_from(pool) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(CREATE_SQL)
+                connection.commit()
+        except Exception as exc:
+            with contextlib.suppress(Exception):
+                pool.closeall()
+            raise DatabaseProblem(classify_database_error(exc), exc)
+        return pool
+
+    @contextlib.contextmanager
+    def _borrow_from(self, pool):
+        connection = pool.getconn()
+        broken = False
+        try:
+            yield connection
+        except Exception:
+            # Never hand a half-used or broken connection back to the pool.
+            broken = True
+            raise
+        finally:
+            with contextlib.suppress(Exception):
+                pool.putconn(connection, close=broken)
+
+    def _borrow(self):
+        return self._borrow_from(self._ensure_pool())
+
+    def insert(self, body):
+        observed = as_utc(datetime.fromisoformat(body["observed_at"]))
+        note = body.get("note")
+        event_id = body["event_id"]
+        try:
+            with self._borrow() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(INSERT_SQL,
+                                   (event_id, body["device_id"], observed, body["type"], note))
+                    created = cursor.fetchone()
+                    if created is None:
+                        # The insert lost the race, or the row already existed.
+                        # Only now is a read justified: to tell 200 from 409.
+                        cursor.execute(SELECT_BY_ID_SQL, (event_id,))
+                        stored = cursor.fetchone()
+                    else:
+                        stored = None
+                connection.commit()
+        except DatabaseProblem:
+            raise
+        except Exception as exc:
+            raise DatabaseProblem(classify_database_error(exc), exc)
+
+        if created is not None:
+            event = dict(body)
+            event["received_at"] = iso(created[0])
+            return "created", event
+
+        device_id, stored_observed, stored_type, stored_note, received_at = stored
+        identical = (
+            device_id == body["device_id"]
+            and as_utc(stored_observed) == observed
+            and stored_type == body["type"]
+            and stored_note == note
+        )
+        if not identical:
+            return "conflict", None
+        # 200, and the original received_at: proof that nothing new was written.
+        event = dict(body)
+        event["received_at"] = iso(received_at)
+        return "same", event
+
+    def recent(self, limit):
+        try:
+            with self._borrow() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(RECENT_SQL, (limit,))
+                    rows = cursor.fetchall()
+                connection.commit()
+        except DatabaseProblem:
+            raise
+        except Exception as exc:
+            raise DatabaseProblem(classify_database_error(exc), exc)
+        # ASCENDING, like W4's dict order, so the display page reads oldest first.
+        return [self._row_to_event(row) for row in reversed(rows)]
+
+    def get(self, event_id):
+        try:
+            with self._borrow() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(SELECT_BY_ID_SQL, (event_id,))
+                    row = cursor.fetchone()
+                connection.commit()
+        except DatabaseProblem:
+            raise
+        except Exception as exc:
+            raise DatabaseProblem(classify_database_error(exc), exc)
+        return None if row is None else self._row_to_event((event_id,) + tuple(row))
+
+    @staticmethod
+    def _row_to_event(row):
+        event_id, device_id, observed, kind, note, received_at = row
+        event = {"event_id": event_id, "device_id": device_id,
+                 "observed_at": iso(observed), "type": kind}
+        if note is not None:
+            event["note"] = note
+        event["received_at"] = iso(received_at)
+        return event
+
+
+def database_config_from_environment(environ=None):
+    """Return the DB_* settings, or None when the secret is not fully present.
+
+    A partially filled set is treated as absent on purpose: connecting with an
+    empty password looks exactly like an authentication failure and costs a
+    round of guessing.
+    """
+    env = os.environ if environ is None else environ
+    required = ("DB_HOST", "DB_NAME", "DB_USER", "DB_PASSWORD")
+    if not all((env.get(name) or "").strip() for name in required):
+        return None
+    try:
+        port = int(env.get("DB_PORT") or 5432)
+    except ValueError:
+        return None
+    return {
+        "host": env["DB_HOST"].strip(),
+        "port": port,
+        "dbname": env["DB_NAME"].strip(),
+        "user": env["DB_USER"].strip(),
+        "password": env["DB_PASSWORD"],
+        "ca_file": (env.get("DB_CA_FILE") or DB_CA_FILE).strip(),
+    }
+
+
+def store_from_environment(environ=None, tokens=None):
+    """Pick the durable store when the secret is present, the W4 one otherwise."""
+    config = database_config_from_environment(environ)
+    if config is None:
+        return MemoryStore(tokens)
+    return PostgresStore(config, tokens)
 
 
 def validate_event(body):
@@ -119,11 +469,14 @@ def validate_event(body):
             raise Rejected(400, "note_too_long", "note")
 
 
-def make_server(version_file, port=8080, tokens=None):
+def make_server(version_file, port=8080, tokens=None, store=None):
     version = Path(version_file).read_text(encoding="utf-8").strip()
     if not re.fullmatch(r"[0-9a-f]{40}", version):
         raise ValueError("version must contain the deployed 40-character Git commit SHA")
-    store = Store(tokens)
+    if store is None:
+        # No store injected -> build one from the environment. The offline suite
+        # injects its own and therefore needs no environment at all.
+        store = store_from_environment(tokens=tokens)
     started = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
     class Handler(BaseHTTPRequestHandler):
@@ -188,16 +541,20 @@ def make_server(version_file, port=8080, tokens=None):
                 except (ValueError, UnicodeDecodeError):
                     raise Rejected(400, "malformed_json", "body")
                 validate_event(body)               # 3) 400
-                with store.lock:                    # check-and-insert must be atomic
-                    if body["event_id"] in store.events:
-                        raise Rejected(409, "duplicate_event_id", "event_id")
-                    event = dict(body)
-                    event["received_at"] = datetime.now(timezone.utc).isoformat(
-                        timespec="seconds").replace("+00:00", "Z")
-                    store.events[event["event_id"]] = event
-                self._send(201, event)              # 4) 201
+                # 4) the store decides: the primary key settles whether this is a
+                #    first delivery (201), an identical repeat (200) or a
+                #    different event wearing an existing id (409).
+                outcome, event = store.insert(body)
+                if outcome == "conflict":
+                    raise Rejected(409, "duplicate_event_id", "event_id")
+                self._send(201 if outcome == "created" else 200, event)
             except Rejected as exc:
                 self._report(exc)
+            except DatabaseProblem as problem:
+                # The client learns only that the database is unavailable. The
+                # category goes to the journal, never into the reply.
+                note_database_problem(problem)
+                self._refuse(503, "database_unavailable")
 
         def do_GET(self):
             route = self.path.split("?", 1)[0]
@@ -205,21 +562,21 @@ def make_server(version_file, port=8080, tokens=None):
                 if route == "/health":
                     self._send(200, {"status": "ok", "service": "inspection", "version": version,
                                      "started_at": started,
-                                     "auth_configured": store.auth_configured})
+                                     "auth_configured": store.auth_configured,
+                                     "db_configured": store.kind == "postgres",
+                                     "storage": store.kind})
                     return
                 if route == "/":
                     self._send(200, DISPLAY_PAGE.encode("utf-8"), "text/html; charset=utf-8")
                     return
                 if route == "/events":
                     self._require("operator")
-                    with store.lock:
-                        events = list(store.events.values())[-LIST_LIMIT:]
+                    events = store.recent(LIST_LIMIT)
                     self._send(200, {"count": len(events), "events": events})
                     return
                 if route.startswith("/events/"):
                     self._require("operator")
-                    with store.lock:
-                        event = store.events.get(route[len("/events/"):])
+                    event = store.get(route[len("/events/"):])
                     if event is None:
                         self._refuse(404, "not_found", "event_id")
                         return
@@ -228,6 +585,9 @@ def make_server(version_file, port=8080, tokens=None):
                 self._refuse(404, "not_found")
             except Rejected as exc:
                 self._report(exc)
+            except DatabaseProblem as problem:
+                note_database_problem(problem)
+                self._refuse(503, "database_unavailable")
 
         def log_message(self, fmt, *args):
             pass  # Never log request paths, bodies, headers, tokens or query strings.

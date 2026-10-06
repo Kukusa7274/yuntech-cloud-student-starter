@@ -17,6 +17,7 @@ stdout, never user data, never Git.
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -80,6 +81,75 @@ def health(ip, timeout=8):
         return 0, {}
 
 
+def combine_secrets(app_env, db_env):
+    """Concatenate the two 600 secret files into one staging file.
+
+    The remote service reads a single EnvironmentFile, so the tokens and the
+    database settings have to arrive together. The staging file is created with
+    O_EXCL at mode 600 and is removed in the caller's finally block, so the
+    combined secret never sits on disk any longer than the originals do.
+
+    A duplicated key would silently take the LAST value systemd reads, so the
+    duplicate check is explicit: a mistyped db.env is a stop, not a surprise.
+    """
+    seen = {}
+    for path in (app_env, db_env):
+        if not path or not os.path.exists(path):
+            continue
+        with open(path, encoding="utf-8") as stream:
+            for number, line in enumerate(stream, 1):
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                if "=" not in stripped:
+                    raise SystemExit(f"STOP: {path}:{number} is not KEY=value")
+                key = stripped.split("=", 1)[0].strip()
+                # systemd's EnvironmentFile only accepts [A-Za-z_][A-Za-z0-9_]* as a
+                # name. A key with a space in it would not fail here -- it would
+                # fail later, on the host, as a service that will not start.
+                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+                    raise SystemExit(f"STOP: {path}:{number} has an unusable key name "
+                                     f"{key!r}; systemd accepts [A-Za-z_][A-Za-z0-9_]* only.")
+                if key in seen:
+                    raise SystemExit(f"STOP: {key} is set in both {seen[key]} and {path};"
+                                     f" the later value would silently win.")
+                seen[key] = f"{path}:{number}"
+
+    if db_env and os.path.exists(db_env):
+        values = {}
+        with open(db_env, encoding="utf-8") as stream:
+            for line in stream:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, value = line.split("=", 1)
+                    values[key.strip()] = value.strip()
+        # db-up.sh writes the password to disk the moment create-db-instance returns,
+        # with DB_HOST still blank, because the master password cannot be read back
+        # from AWS later. Deploying that placeholder would start the service against
+        # an empty host, and the failure would look like a database outage hours later.
+        blank = [k for k in ("DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD")
+                 if not values.get(k)]
+        if blank:
+            raise SystemExit(f"STOP: {db_env} is missing or has an empty {', '.join(blank)}."
+                             " This is the placeholder db-up.sh writes before the instance"
+                             " is available; the endpoint is filled in at the end of"
+                             " db-up.sh. Deploying it would point the service at a blank host.")
+
+    staging = app_env + ".combined"
+    parts = []
+    for path in (app_env, db_env):
+        if not path or not os.path.exists(path):
+            continue
+        with open(path, encoding="utf-8") as stream:
+            body = stream.read()
+        parts.append(f"# --- from {os.path.basename(path)} ---\n"
+                     + (body if body.endswith("\n") else body + "\n"))
+    with open(os.open(staging, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600), "w",
+              encoding="utf-8") as out:
+        out.write("".join(parts))
+    return staging
+
+
 def main():
     res_path = os.environ["RES_FILE"]
     key = os.environ["SSH_KEY"]
@@ -117,17 +187,28 @@ def main():
         sys.exit(1)
     print(f"[installed] committed build in place  {now()}")
 
-    # --- 2) push the token file on stdin; umask 077 makes it 600 before it is ever written ---
-    push = shq(f"umask 077 && mkdir -p {os.path.dirname(REMOTE_SECRET)} && cat > {REMOTE_SECRET}")
-    result = ssh_run(["sudo", "sh", "-c", push], key, ip, stdin_file=secret)
-    if result.returncode:
-        print("STOP: could not place the token file. Nothing is printed about its contents.")
-        print("stderr tail:", (result.stderr or "")[-200:])
-        sys.exit(1)
+    # --- 2) push the combined secret on stdin; umask 077 makes it 600 before it is ever written ---
+    db_env = os.environ.get("DB_ENV_FILE") or ""
+    db_optional = os.environ.get("DB_SECRET_OPTIONAL") == "1"
+    with_db = bool(db_env) and os.path.exists(db_env)
+    staging = combine_secrets(secret, db_env)
+    try:
+        push = shq(f"umask 077 && mkdir -p {os.path.dirname(REMOTE_SECRET)} && cat > {REMOTE_SECRET}")
+        result = ssh_run(["sudo", "sh", "-c", push], key, ip, stdin_file=staging)
+        if result.returncode:
+            print("STOP: could not place the secret file. Nothing is printed about its contents.")
+            print("stderr tail:", (result.stderr or "")[-200:])
+            sys.exit(1)
+    finally:
+        # The combined copy holds both the tokens and the database password.
+        if os.path.exists(staging):
+            os.unlink(staging)
+    print(f"[secret] {REMOTE_SECRET} written"
+          f"{' (tokens + database settings)' if with_db else ' (tokens only)'}  {now()}")
     mode = ssh_run(["sudo", "stat", "-c", "%a", REMOTE_SECRET], key, ip)
-    print(f"[secret] {REMOTE_SECRET} installed, mode {mode.stdout.strip()}  {now()}")
+    print(f"[secret] {REMOTE_SECRET} mode {mode.stdout.strip()}  {now()}")
     if mode.stdout.strip() != "600":
-        print("STOP: token file is not 600 on the host.")
+        print("STOP: secret file is not 600 on the host.")
         sys.exit(1)
 
     # --- 3) restart so the service actually reads the token file ---
@@ -138,7 +219,8 @@ def main():
         sys.exit(1)
     print(f"[restarted] inspection re-read its environment  {now()}")
 
-    # --- 4) verify: same commit AND authentication actually configured ---
+    # --- 4) verify: same commit, authentication, and (when a DB secret was sent)
+    #        that the service really came up on the database ---
     status, body = 0, {}
     for _ in range(20):
         status, body = health(ip)
@@ -146,20 +228,34 @@ def main():
             break
         time.sleep(3)
     print(f"[verify] /health http={status} version_match={body.get('version') == commit} "
-          f"auth_configured={body.get('auth_configured')}  {now()}")
+          f"auth_configured={body.get('auth_configured')} "
+          f"db_configured={body.get('db_configured')} storage={body.get('storage')}  {now()}")
     if status != 200 or body.get("version") != commit:
         print("STOP: /health does not report the deployed commit.")
         sys.exit(1)
     if body.get("auth_configured") is not True:
         print("STOP: auth_configured is not true -- the token file did not reach the service.")
         sys.exit(1)
+    if with_db and body.get("db_configured") is not True:
+        # The secret file is in place and the service still came up on the memory
+        # store. Reporting success here would be the worst outcome: the host looks
+        # healthy, events work, and they all disappear on the next restart.
+        print("STOP: the database secret was sent but /health reports db_configured=false.")
+        print("      The service is running in its degraded W4 mode. Do NOT record this as a")
+        print("      successful deployment. Check: sudo journalctl -u inspection -n 30")
+        sys.exit(1)
+    if not with_db and body.get("db_configured"):
+        print("[note] the service reports db_configured=true although no DB secret was sent;"
+              " the host kept settings from an earlier deployment")
 
     res["instance"]["state"] = "running"
     res["instance"]["public_ip"] = ip
     res["deployed_commit"] = commit
     res["deployed_utc"] = now()
+    res["db_configured"] = bool(body.get("db_configured"))
     save(res, res_path)
-    print(f"DEPLOY OK at {now()} (version {commit[:7]}, auth_configured true)")
+    print(f"DEPLOY OK at {now()} (version {commit[:7]}, auth_configured true, "
+          f"db_configured {str(body.get('db_configured')).lower()})")
 
 
 if __name__ == "__main__":

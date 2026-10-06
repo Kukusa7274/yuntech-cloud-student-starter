@@ -24,6 +24,7 @@ source "$CFG"
 
 RES="$ROOT/.local/resources.json"
 SECRET="$ROOT/.local/app.env"
+DBENV="$ROOT/.local/db.env"
 UD="$ROOT/.local/w04-user-data.sh"
 KEY="$HOME/.ssh/${W3_NAME_PREFIX}_ed25519"
 
@@ -52,6 +53,25 @@ if [ "$SECRET_MODE" != "600" ]; then
   echo "      Not loosening or tightening it automatically -- that hides a real mistake."
   exit 1
 fi
+
+# W5 adds the database secret. It is optional only because a host can be rebuilt
+# with up.sh before T2 has created the database; in that case the deployment
+# still has to succeed, and /health will honestly report db_configured=false.
+DB_SECRET_OPTIONAL=0
+if [ -f "$DBENV" ]; then
+  DBENV_MODE="$(stat -c '%a' "$DBENV")"
+  if [ "$DBENV_MODE" != "600" ]; then
+    echo "STOP: .local/db.env is mode $DBENV_MODE, not 600. Fix it yourself (chmod 600) and re-run."
+    exit 1
+  fi
+  DB_SECRET_OPTIONAL=0
+elif [ "${W5_REQUIRE_DB:-0}" = "1" ]; then
+  echo "STOP: W5_REQUIRE_DB=1 but .local/db.env does not exist."
+  echo "      Run deploy/db-up.sh first, or drop the requirement if the database is not built yet."
+  exit 1
+else
+  DB_SECRET_OPTIONAL=1
+fi
 git -C "$ROOT" rev-parse --verify --quiet "${COMMIT}^{commit}" >/dev/null \
   || { echo "STOP: '$COMMIT' is not a commit in this repository."; exit 1; }
 
@@ -67,6 +87,15 @@ echo "  Commit      : $COMMIT  ($COMMIT_FULL)"
 echo "              packaging app/service.py + deploy/nginx.conf only, then reinstalling on the host"
 echo "  Secret file : .local/app.env (mode 600, contents never shown)"
 echo "                -> /etc/inspection/app.env (root, 600) over SSH stdin, then inspection restarted"
+if [ "$DB_SECRET_OPTIONAL" = "1" ]; then
+  echo "  DB secret   : .local/db.env is ABSENT -- the service will start and /health will"
+  echo "                report db_configured=false. Events will NOT survive a restart."
+  echo "                (Expected only before T2 builds the database.)"
+else
+  echo "  DB secret   : .local/db.env (mode 600, contents never shown) is appended to the same"
+  echo "                remote file, so one restart gives the service tokens AND the database"
+  echo "                settings. db_configured must come back true or the deploy fails."
+fi
 echo "  Cost        : none; no resource is created or deleted. Public IPv4 already attached."
 echo "  Key         : $KEY  (same ed25519 key pair imported in W3)"
 echo
@@ -80,5 +109,6 @@ fi
 # make_user_data.py opens its output with exclusive create, so clear it first.
 rm -f "$UD"
 export W3_REGION SSH_KEY="$KEY" UD_FILE="$UD" RES_FILE="$RES" SECRET_FILE="$SECRET"
+export DB_ENV_FILE="$DBENV" DB_SECRET_OPTIONAL
 export W3_GROUP="$W3_GROUP" W3_OWNER="$W3_OWNER" DEPLOY_COMMIT_FULL="$COMMIT_FULL"
 python3 "$ROOT/deploy/deploy_aws.py"
