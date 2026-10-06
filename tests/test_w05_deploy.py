@@ -232,6 +232,35 @@ class RemoteFragmentQuoting(unittest.TestCase):
         self.assertEqual(deploy_aws.shq("it's"), "'it'\\''s'")
 
 
+class TagSpecifications(unittest.TestCase):
+    """--tag-specifications is a shorthand string. The literal braces are part of
+    the syntax, so building it with one format call over the whole template
+    raised TypeError: not enough arguments for format string."""
+
+    def setUp(self):
+        for key, value in (("W3_GROUP", "test-group"), ("W3_OWNER", "test-owner")):
+            self.addCleanup(os.environ.pop, key, None)
+            os.environ[key] = value
+
+    def test_each_resource_type_gets_the_same_four_audit_keys(self):
+        spec = db_aws.tag_spec("route-table")
+        self.assertTrue(spec.startswith("ResourceType=route-table,Tags=["))
+        for key in ("course=yuntech-115-1", "week=w05",
+                    "group=test-group", "owner=test-owner"):
+            self.assertIn("{Key=" + key.split("=")[0] + ",Value=" + key.split("=", 1)[1] + "}", spec)
+        self.assertEqual(spec.count("ResourceType="), 1)
+
+    def test_braces_are_literal_not_format_placeholders(self):
+        # The inner braces survive, which is what the CLI parser needs; and the
+        # call cannot raise, which is what broke db-up.sh on its first create.
+        self.assertIn("{Key=course,Value=yuntech-115-1}", db_aws.tag_spec("subnet"))
+        self.assertNotIn("%s", db_aws.tag_spec("subnet"))
+
+    def test_the_week_tag_follows_the_caller(self):
+        self.assertIn("Value=w05", db_aws.tag_spec("db-instance"))
+        self.assertIn("Value=w06", db_aws.tag_spec("db-instance", prefix="w06"))
+
+
 class SingleValueProjection(unittest.TestCase):
     """`aws --query 'Vpcs[0].CidrBlock'` returns a bare string. Indexing it as a
     list yields the first CHARACTER, and 172.31.0.0/16 becomes "1"."""

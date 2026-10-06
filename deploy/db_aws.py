@@ -60,12 +60,17 @@ def save(res, path):
     os.replace(tmp, path)
 
 
-def tags(prefix="w05"):
-    """Same four keys as W3 so ownership is auditable from the console alone."""
+def tag_spec(restype, prefix="w05"):
+    """AWS CLI shorthand for --tag-specifications: Tags=[{Key=...,Value=...}].
+
+    Same four keys as W3 so ownership is auditable from the console alone. The
+    inner string must contain literal braces for the CLI parser, so the result is
+    built here rather than with a single format call over the whole template.
+    """
     inner = ",".join("{Key=%s,Value=%s}" % (k, v) for k, v in (
         ("course", "yuntech-115-1"), ("week", prefix),
         ("group", os.environ["W3_GROUP"]), ("owner", os.environ["W3_OWNER"])))
-    return "ResourceType=%s,Tags=[%s]"
+    return "ResourceType=%s,Tags=[%s]" % (restype, inner)
 
 
 def pick_subnets(vpc_id, vpc_cidr, existing_cidrs, needed=2):
@@ -181,7 +186,7 @@ def main():
     # ---------- 1) route table (local route only) ----------
     rt = aw(["ec2", "create-route-table", "--vpc-id", vpc_id,
              "--description", "W5 private DB subnets, local route only",
-             "--tag-specifications", tags() % "route-table"])
+             "--tag-specifications", tag_spec("route-table")])
     rt_id = rt["RouteTable"]["RouteTableId"]
     res["db"] = {"route_table": {"id": rt_id}}
     save(res, res_path)
@@ -198,7 +203,7 @@ def main():
     for cidr, az in plan:
         sub = aw(["ec2", "create-subnet", "--vpc-id", vpc_id, "--cidr-block", cidr,
                   "--availability-zone", az,
-                  "--tag-specifications", tags() % "subnet"])
+                  "--tag-specifications", tag_spec("subnet")])
         sid = sub["Subnet"]["SubnetId"]
         key = "subnet_" + az.split("-")[-1]
         res["db"].setdefault("subnets", []).append({"id": sid, "cidr": cidr, "az": az})
@@ -247,7 +252,7 @@ def main():
     # ---------- 4) SG-db: inbound 5432 from the host SG, nothing else ----------
     sg = aw(["ec2", "create-security-group", "--group-name", prefix + "-sg-db",
              "--description", "W5 RDS: inbound 5432 from the host SG only",
-             "--vpc-id", vpc_id, "--tag-specifications", tags() % "security-group"])
+             "--vpc-id", vpc_id, "--tag-specifications", tag_spec("security-group")])
     sg_id = sg["GroupId"]
     res["db"]["sg"] = {"id": sg_id, "name": prefix + "-sg-db", "ingress_from_sg": host_sg}
     save(res, res_path)
