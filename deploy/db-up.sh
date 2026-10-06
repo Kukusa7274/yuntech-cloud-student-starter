@@ -49,12 +49,22 @@ fi
 
 [ -f "$RES" ] || { echo "STOP: missing $RES -- no recorded host to sit beside."; exit 1; }
 
-# Refuse to build a second database tier. Re-running this script after a partial
-# failure is how you end up paying for two RDS instances.
-if python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); raise SystemExit(0 if "db" in d else 1)' "$RES"; then
-  echo "STOP: .local/resources.json already has a \"db\" section -- a database tier exists."
-  echo "      Do not re-run this script: it would create a SECOND RDS instance."
-  echo "      If your first instance failed mid-creation, fix or delete that instance by ID first."
+RESUME=0
+if python3 -c '
+import json,sys
+d=json.load(open(sys.argv[1],encoding="utf-8")).get("db")
+ok=(isinstance(d,dict)
+    and isinstance(d.get("route_table"),dict)
+    and bool(d["route_table"].get("id"))
+    and isinstance(d.get("subnets"),list)
+    and len(d["subnets"])==2
+    and not any(k in d for k in ("subnet_group","sg","rds")))
+raise SystemExit(0 if ok else 1)' "$RES"; then
+  RESUME=1
+elif python3 -c 'import json,sys; raise SystemExit(0 if "db" in json.load(open(sys.argv[1],encoding="utf-8")) else 1)' "$RES"; then
+  echo "STOP: .local/resources.json records a W5 database tier beyond the supported"
+  echo "      network-only resume point. Do not rerun: an RDS instance may already exist."
+  echo "      Inspect the recorded resource IDs and recover that exact state first."
   exit 1
 fi
 
@@ -71,11 +81,16 @@ if [ -e "$DBENV" ]; then
   exit 1
 fi
 
-echo "== db-up.sh: resources to CREATE (W5 T2 scope) =="
-echo "  Subnets      : two new /24 in $W3_VPC_ID, non-overlapping with existing subnets,"
-echo "                 in two different AZs, each explicitly associated to the new route table"
-echo "  Route table  : one, local route only (no 0.0.0.0/0 -> igw): that association is what"
-echo "                 makes the subnets private"
+if [ "$RESUME" = "1" ]; then
+  echo "== db-up.sh: resume W5 T2 from recorded network resources =="
+  echo "  Existing     : verify and reuse only the route table and two subnets in resources.json"
+else
+  echo "== db-up.sh: resources to CREATE (W5 T2 scope) =="
+  echo "  Subnets      : two new /24 in $W3_VPC_ID, non-overlapping with existing subnets,"
+  echo "                 in two different AZs, each explicitly associated to the new route table"
+  echo "  Route table  : one, local route only (no 0.0.0.0/0 -> igw): that association is what"
+  echo "                 makes the subnets private"
+fi
 echo "  DB subnet grp: one, naming both subnets (RDS requires >= 2 AZs to place it)"
 echo "  SG-db        : one, INBOUND TCP 5432 ONLY, source = the host SG from resources.json"
 echo "                 (a reference to the SG, NOT your IP and NOT 0.0.0.0/0)"

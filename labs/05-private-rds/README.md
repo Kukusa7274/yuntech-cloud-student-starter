@@ -129,6 +129,7 @@ Copilot 寫的程式通常能跑，但常漏掉下面這些。commit 前逐條�
 - **服務連不到資料庫**：先分類——逾時（SG、路由）、密碼錯（秘密檔）、憑證驗證失敗（憑證檔、名稱）、SQL 錯（程式）。不要把 `sslmode` 改成 `disable`。
 - **部署後健康頁 502**：nginx 還在、服務沒起來（W3 學過）。看服務日誌 `sudo journalctl -u inspection -n 30`，找出是連不到、密碼、憑證還是 SQL 的問題，再照上一條處理。
 - **RDS 一直在建立中**：正常要好幾分鐘（老師實測約 7.5 分鐘）；不要重跑 `db-up.sh`，會建出第二台。
+- **RDS 已經存在，但 `db-up.sh` 在讀回時停止**：不要重跑 `db-up.sh`，也不要刪除資料庫。先確認 `.local/db.env` 與 `.local/resources.json` 還在，再執行 `bash deploy/db-resume.sh`。它會唯讀核對已記錄的 RDS、私有路由表與 SG-db；全部符合才更新本機 endpoint 和狀態，不建立、修改或刪除 AWS 資源，也不更換密碼。若檢查不符會停止並保留現狀。
 - **Codespace 連得到 5432**：錯了，立刻停下檢查 `PubliclyAccessible` 與 SG-db 來源。
 - **同一個點卡了超過 10 分鐘**：先問 AI 或隔壁同學；還是不行，記下最後成功的那一步與錯誤訊息，再找老師。
 

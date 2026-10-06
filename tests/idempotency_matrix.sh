@@ -76,10 +76,13 @@ IID="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1],encoding="ut
 # and a stale address looks exactly like a broken service.
 # Read-only, through the same lab.run_aws path as every other course call.
 IP="$(python3 - "$ROOT" "$IID" <<'PY' 2>/dev/null
+import contextlib
+import io
 import sys
 sys.path.insert(0, sys.argv[1] + "/scripts")
 import lab
-ctx = lab.verify()
+with contextlib.redirect_stdout(io.StringIO()):
+    ctx = lab.verify()
 row = lab.run_aws(["ec2", "describe-instances", "--instance-ids", sys.argv[2],
                    "--query", "Reservations[0].Instances[0].[State.Name,PublicIpAddress]"],
                   ctx["region"])

@@ -74,6 +74,8 @@ class FakeAws:
                         "subnet-group": None, "db": None}
         self.associated = set()
         self.polls = 0
+        self.resuming = False
+        self.recovery_public = False
 
     # ---- the callable db_aws.aw() expects -------------------------------
     def __call__(self, args):
@@ -83,6 +85,15 @@ class FakeAws:
         if service == "ec2" and action == "describe-vpcs":
             return "172.31.0.0/16"          # bare string, the trap from run 1
         if service == "ec2" and action == "describe-subnets":
+            if "SubnetId" in flat:
+                rows = [[s["SubnetId"], s["AvailabilityZone"], s["CidrBlock"]]
+                        for s in REAL_SUBNETS]
+                if self.resuming:
+                    rows.extend([
+                        ["subnet-resume-a", "us-east-1a", "172.31.96.0/24"],
+                        ["subnet-resume-b", "us-east-1b", "172.31.97.0/24"],
+                    ])
+                return rows
             # The real call carries --query 'Subnets[].[AvailabilityZone,CidrBlock]',
             # so each row arrives as a two-element list, not as a dict.
             return [[s["AvailabilityZone"], s["CidrBlock"]] for s in REAL_SUBNETS]
@@ -90,9 +101,14 @@ class FakeAws:
             self.created["route-table"] = "rtb-0abc123"
             return {"RouteTable": {"RouteTableId": "rtb-0abc123"}}
         if service == "ec2" and action == "describe-route-tables":
+            if "RouteTables[0].{" in flat:
+                return {"VpcId": VPC, "Gateways": ["local"],
+                        "Subnets": ["subnet-resume-a", "subnet-resume-b"]}
             if "Associations[?" in flat:
                 side = flat.split("SubnetId==`")[-1].split("`]")[0]
                 return [side] if side in self.associated else []
+            if "VpcId" in flat:
+                return VPC
             if "Routes" in flat:
                 return [["172.31.0.0/16", "local"]]
             return [{"Main": False, "SubnetId": None}]
@@ -123,9 +139,23 @@ class FakeAws:
             self.created["db"] = "w03-g8-o1-w5"
             return {"DBInstance": {"DBInstanceIdentifier": "w03-g8-o1-w5"}}
         if service == "rds" and action == "describe-db-instances":
+            if "Identifier:DBInstanceIdentifier" in flat:
+                return {
+                    "Identifier": "w03-g8-o1-w5", "Status": "available",
+                    "Public": self.recovery_public, "Encrypted": True,
+                    "Allocated": 20, "StorageType": "gp3", "MultiAZ": False,
+                    "Engine": "postgres", "Class": "db.t3.micro",
+                    "Master": "inspection", "DBName": "inspection",
+                    "Endpoint": "db.rehearsal.invalid", "Port": 5432,
+                    "SubnetGroup": "w03-g8-o1-db-subnets", "Vpc": VPC,
+                    "Subnets": ["subnet-resume-a", "subnet-resume-b"],
+                    "SecurityGroups": ["sg-0db999"],
+                }
             if "DBInstanceStatus" in flat:               # the polling query
                 self.polls += 1
                 return ["available" if self.polls > 1 else "creating", None]
+            if "DBSubnetGroup.DBSubnetGroupName" not in flat:
+                raise AssertionError("DB subnet group name must use the nested RDS response field")
             return ["db.rehearsal.invalid", 5432, True, 20, "gp3", False,
                     "w03-g8-o1-db-subnets", "sg-0db999", False,
                     "postgres", "db.t3.micro", "inspection", "inspection"]
@@ -156,13 +186,99 @@ class Rehearsal(unittest.TestCase):
         no_sleep.start()
         self.addCleanup(no_sleep.stop)
 
-    def run_main(self):
-        aws = FakeAws()
+    def run_main(self, aws=None):
+        aws = aws or FakeAws()
         with mock.patch.object(db_aws, "aw", aws), \
              mock.patch.object(db_aws.lab, "verify", return_value={"region": "us-east-1"}), \
              mock.patch("builtins.print"):
             db_aws.main()
         return aws
+
+    def prepare_recovery(self):
+        self.res.write_text(json.dumps({
+            "sg": {"id": HOST_SG},
+            "db": {
+                "route_table": {"id": "rtb-resume"},
+                "subnets": [
+                    {"id": "subnet-resume-a", "cidr": "172.31.96.0/24",
+                     "az": "us-east-1a"},
+                    {"id": "subnet-resume-b", "cidr": "172.31.97.0/24",
+                     "az": "us-east-1b"},
+                ],
+                "subnet_group": {
+                    "name": "w03-g8-o1-db-subnets",
+                    "subnet_ids": ["subnet-resume-a", "subnet-resume-b"],
+                },
+                "sg": {"id": "sg-0db999", "ingress_from_sg": HOST_SG},
+                "rds": {"identifier": "w03-g8-o1-w5", "state": "creating"},
+                "secret_file": ".local/db.env",
+            },
+        }), encoding="utf-8")
+        self.db_env.write_text(
+            "# existing W5 secret\nDB_HOST=\nDB_PORT=5432\nDB_NAME=inspection\n"
+            "DB_USER=inspection\nDB_PASSWORD=keep-this-private\n",
+            encoding="utf-8")
+        os.chmod(self.db_env, 0o600)
+
+    def run_recovery(self, aws):
+        with mock.patch.object(db_aws, "aw", aws), \
+             mock.patch.object(db_aws.lab, "verify", return_value={"region": "us-east-1"}), \
+             mock.patch("builtins.print"):
+            db_aws.recover_existing()
+
+    def test_recovery_fills_endpoint_preserves_password_and_only_reads_aws(self):
+        self.prepare_recovery()
+        aws = FakeAws()
+        self.run_recovery(aws)
+        body = dict(line.split("=", 1) for line in
+                    self.db_env.read_text(encoding="utf-8").splitlines()
+                    if line and not line.startswith("#"))
+        self.assertEqual(body["DB_HOST"], "db.rehearsal.invalid")
+        self.assertEqual(body["DB_PASSWORD"], "keep-this-private")
+        self.assertEqual(os.stat(self.db_env).st_mode & 0o777, 0o600)
+        saved = json.loads(self.res.read_text(encoding="utf-8"))["db"]["rds"]
+        self.assertEqual(saved["state"], "available")
+        self.assertEqual(saved["endpoint"], "db.rehearsal.invalid")
+        self.assertTrue(all(call[1] in ("describe-db-instances",
+                                        "describe-route-tables",
+                                        "describe-security-groups")
+                            for call in aws.calls))
+
+    def test_recovery_refuses_public_instance_without_changing_local_files(self):
+        self.prepare_recovery()
+        before_secret = self.db_env.read_bytes()
+        before_record = self.res.read_bytes()
+        aws = FakeAws()
+        aws.recovery_public = True
+        with self.assertRaisesRegex(SystemExit, "Public is True"):
+            self.run_recovery(aws)
+        self.assertEqual(self.db_env.read_bytes(), before_secret)
+        self.assertEqual(self.res.read_bytes(), before_record)
+
+    def test_network_only_partial_state_resumes_without_recreating_it(self):
+        self.res.write_text(json.dumps({
+            "sg": {"id": HOST_SG},
+            "instance": {"id": "i-0b6a509de0b71f42e"},
+            "db": {
+                "route_table": {"id": "rtb-0abc123"},
+                "subnets": [
+                    {"id": "subnet-resume-a", "cidr": "172.31.96.0/24",
+                     "az": "us-east-1a"},
+                    {"id": "subnet-resume-b", "cidr": "172.31.97.0/24",
+                     "az": "us-east-1b"},
+                ],
+            },
+        }), encoding="utf-8")
+        aws = FakeAws()
+        aws.resuming = True
+        aws.associated.update(("subnet-resume-a", "subnet-resume-b"))
+        self.run_main(aws)
+        actions = [call[1] for call in aws.calls]
+        self.assertNotIn("create-route-table", actions)
+        self.assertNotIn("create-subnet", actions)
+        self.assertNotIn("associate-route-table", actions)
+        self.assertIn("create-db-subnet-group", actions)
+        self.assertIn("create-db-instance", actions)
 
     def test_the_whole_sequence_runs(self):
         aws = self.run_main()                       # must not raise
@@ -175,8 +291,12 @@ class Rehearsal(unittest.TestCase):
 
     def test_the_chosen_subnets_do_not_collide_and_span_two_azs(self):
         self.run_main()
-        plan = db_aws.pick_subnets(VPC, "172.31.0.0/16",
-                                           [r["CidrBlock"] for r in REAL_SUBNETS])
+        with mock.patch.object(
+                db_aws, "aw",
+                return_value=[[row["AvailabilityZone"], row["CidrBlock"]]
+                              for row in REAL_SUBNETS]):
+            plan = db_aws.pick_subnets(VPC, "172.31.0.0/16",
+                                       [r["CidrBlock"] for r in REAL_SUBNETS])
         self.assertEqual([c for c, _ in plan], ["172.31.96.0/24", "172.31.97.0/24"])
         self.assertEqual(len({az for _, az in plan}), 2, "two different AZs")
 
@@ -232,6 +352,21 @@ class Rehearsal(unittest.TestCase):
             spec = call[call.index("--tag-specifications") + 1]
             self.assertNotIn("%s", spec)
             self.assertRegex(spec, r"^ResourceType=[a-z-]+,Tags=\[\{Key=course,Value=yuntech-115-1\},")
+
+    def test_db_subnet_group_tags_are_separate_cli_list_members(self):
+        aws = self.run_main()
+        call = next(c for c in aws.calls
+                    if c[:2] == ["rds", "create-db-subnet-group"])
+        subnet_ids_at = call.index("--subnet-ids")
+        self.assertEqual(call[subnet_ids_at + 1:subnet_ids_at + 3],
+                         ["subnet-new0", "subnet-new1"])
+        tags_at = call.index("--tags")
+        self.assertEqual(call[tags_at + 1:tags_at + 5], [
+            "Key=course,Value=yuntech-115-1",
+            "Key=week,Value=w05",
+            "Key=group,Value=test-group",
+            "Key=owner,Value=test-owner",
+        ])
 
 
 if __name__ == "__main__":
