@@ -115,6 +115,18 @@ def pick_subnets(vpc_id, vpc_cidr, existing_cidrs, needed=2):
     raise SystemExit("STOP: no free /24 left in the VPC CIDR for two subnets.")
 
 
+def first(value):
+    """Unwrap a projection that may come back as a list or as a bare scalar.
+
+    `aws --query 'Vpcs[0].CidrBlock'` returns the string, not ["the string"].
+    Indexing it blindly yields the first CHARACTER -- "1" for 172.31.0.0/16 --
+    which fails much later with a confusing message.
+    """
+    if isinstance(value, list):
+        return value[0] if value else ""
+    return value if value else ""
+
+
 def write_db_env(path, host, port, password, exclusive):
     """Write the database secret: mode 600, never printed, never on a command line.
 
@@ -155,11 +167,11 @@ def main():
         res = json.load(stream)
     host_sg = res["sg"]["id"]
 
-    vpc = aw(["ec2", "describe-vpcs", "--vpc-ids", vpc_id,
-              "--query", "Vpcs[0].CidrBlock"])
-    if not vpc:
-        raise SystemExit(f"STOP: {vpc_id} not found in {REGION}. Is this the right region?")
-    vpc_cidr = vpc[0]
+    vpc_cidr = first(aw(["ec2", "describe-vpcs", "--vpc-ids", vpc_id,
+                     "--query", "Vpcs[0].CidrBlock"]))
+    if not vpc_cidr:
+        raise SystemExit(f"STOP: {vpc_id} has no CidrBlock in {REGION}. "
+                         "Is this the right region?")
 
     plan = pick_subnets(vpc_id, vpc_cidr, [])
     print(f"[plan] VPC {vpc_id} {vpc_cidr}; new subnets: " +

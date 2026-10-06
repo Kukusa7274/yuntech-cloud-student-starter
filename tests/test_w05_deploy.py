@@ -232,6 +232,20 @@ class RemoteFragmentQuoting(unittest.TestCase):
         self.assertEqual(deploy_aws.shq("it's"), "'it'\\''s'")
 
 
+class SingleValueProjection(unittest.TestCase):
+    """`aws --query 'Vpcs[0].CidrBlock'` returns a bare string. Indexing it as a
+    list yields the first CHARACTER, and 172.31.0.0/16 becomes "1"."""
+
+    def test_a_bare_string_is_not_indexed(self):
+        self.assertEqual(db_aws.first("172.31.0.0/16"), "172.31.0.0/16")
+        self.assertEqual(db_aws.first(["172.31.0.0/16"]), "172.31.0.0/16")
+
+    def test_empty_results_become_empty_not_a_crash(self):
+        self.assertEqual(db_aws.first([]), "")
+        self.assertEqual(db_aws.first(None), "")
+        self.assertEqual(db_aws.first(""), "")
+
+
 class SecretFileHygiene(unittest.TestCase):
     """The master password cannot be read back from AWS. Whatever is not on disk
     at the moment create-db-instance returns is gone for good."""
