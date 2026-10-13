@@ -40,6 +40,7 @@ install -d -m 755 /etc/inspection
 curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem -o /etc/inspection/rds-ca.pem
 chmod 644 /etc/inspection/rds-ca.pem
 id inspection >/dev/null 2>&1 || useradd --system --no-create-home --shell /sbin/nologin inspection
+install -d -m 700 -o inspection -g inspection /etc/inspection/iot
 install -d -m 755 /opt/inspection
 base64 --decode <<'W3_ARCHIVE' | tar -xz -C /opt/inspection
 PAYLOAD

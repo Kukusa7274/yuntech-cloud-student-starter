@@ -38,6 +38,7 @@ from pathlib import Path
 import re
 import sys
 import threading
+from urllib.parse import parse_qs, urlparse
 
 MAX_BODY_BYTES = 4 * 1024
 EVENT_TYPES = ("status", "anomaly", "test")
@@ -87,19 +88,24 @@ DISPLAY_PAGE = """<!doctype html>
 <h1>巡檢事件</h1>
 <p>貼上 operator 權令牌後讀取清單。權令牌只留在這個頁面的變數裡，不寫進網址、不存進瀏覽器。</p>
 <p><input id="tok" type="password" autocomplete="off" size="52" placeholder="operator token">
+<input id="device" type="text" autocomplete="off" size="18" placeholder="設備編號">
 <button id="load">讀取清單</button></p>
 <pre id="out">尚未載入。</pre>
 <script>
 var out = document.getElementById("out");
 document.getElementById("load").addEventListener("click", function () {
-  var token = document.getElementById("tok").value;   // 只存在這個頁面變數裡，不寫進網址、不留任何持久儲存
+  var token = document.getElementById("tok").value;
+  var device = document.getElementById("device").value.trim();
+  var path = "/events";
+  if (device) {
+    path += "?device_id=" + encodeURIComponent(device);
+  }
   out.textContent = "載入中…";
-  fetch("/events", {headers: {Authorization: "Bearer " + token}})
+  fetch(path, {headers: {Authorization: "Bearer " + token}})
     .then(function (r) { return r.json().then(function (b) { return {ok: r.ok, code: r.status, body: b}; }); })
     .then(function (res) {
       if (!res.ok) { out.textContent = "HTTP " + res.code + " " + JSON.stringify(res.body); return; }
       var rows = res.body.events.map(function (e) {
-        // note 來自別人送來的文字：一律用 textContent，不當成 HTML 解析。
         return e.received_at + "  " + e.event_id + "  " + e.device_id + "  " + e.type
                + (e.note ? "  " + e.note : "");
       });
@@ -218,9 +224,13 @@ class MemoryStore:
             self.events[body["event_id"]] = event
         return "created", event
 
-    def recent(self, limit):
+    def recent(self, limit, device_id=None):
         with self.lock:
-            return list(self.events.values())[-limit:]
+            items = list(self.events.values())
+            if device_id is not None:
+                items = [event for event in items if event.get("device_id") == device_id]
+                return sorted(items, key=lambda e: e.get("received_at", ""), reverse=True)[:limit]
+            return items[-limit:]
 
     def get(self, event_id):
         with self.lock:
@@ -359,17 +369,26 @@ class PostgresStore:
         event["received_at"] = iso(received_at)
         return "same", event
 
-    def recent(self, limit):
+    def recent(self, limit, device_id=None):
         try:
             with self._borrow() as connection:
                 with connection.cursor() as cursor:
-                    cursor.execute(RECENT_SQL, (limit,))
+                    if device_id is None:
+                        cursor.execute(RECENT_SQL, (limit,))
+                    else:
+                        cursor.execute(
+                            "SELECT event_id, device_id, observed_at, type, note, received_at "
+                            "FROM events WHERE device_id = %s ORDER BY received_at DESC, event_id DESC LIMIT %s",
+                            (device_id, limit),
+                        )
                     rows = cursor.fetchall()
                 connection.commit()
         except DatabaseProblem:
             raise
         except Exception as exc:
             raise DatabaseProblem(classify_database_error(exc), exc)
+        if device_id is not None:
+            return [self._row_to_event(row) for row in rows]
         # ASCENDING, like W4's dict order, so the display page reads oldest first.
         return [self._row_to_event(row) for row in reversed(rows)]
 
@@ -571,7 +590,13 @@ def make_server(version_file, port=8080, tokens=None, store=None):
                     return
                 if route == "/events":
                     self._require("operator")
-                    events = store.recent(LIST_LIMIT)
+                    query = parse_qs(urlparse(self.path).query)
+                    device_id = query.get("device_id", [None])[0]
+                    if device_id is not None and device_id.strip() == "":
+                        device_id = None
+                    if device_id is not None and not DEVICE_ID_RE.fullmatch(device_id):
+                        raise Rejected(400, "invalid_device_id", "device_id")
+                    events = store.recent(LIST_LIMIT, device_id=device_id)
                     self._send(200, {"count": len(events), "events": events})
                     return
                 if route.startswith("/events/"):
