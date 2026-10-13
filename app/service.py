@@ -181,6 +181,15 @@ def note_database_problem(problem):
     print(f"db-error category={problem.category} driver={kind}", file=sys.stderr, flush=True)
 
 
+def normalize_iso8601(value):
+    """Accept both RFC3339 `Z` and numeric-offset strings across Python versions."""
+    if not isinstance(value, str):
+        return value
+    if value.endswith("Z"):
+        return value[:-1] + "+00:00"
+    return value
+
+
 def iso(moment):
     """Render an aware datetime the way the W4 contract rendered it."""
     if moment is None:
@@ -328,7 +337,7 @@ class PostgresStore:
         return self._borrow_from(self._ensure_pool())
 
     def insert(self, body):
-        observed = as_utc(datetime.fromisoformat(body["observed_at"]))
+        observed = as_utc(datetime.fromisoformat(normalize_iso8601(body["observed_at"])))
         note = body.get("note")
         event_id = body["event_id"]
         try:
@@ -473,7 +482,7 @@ def validate_event(body):
     if not isinstance(observed, str):
         raise Rejected(400, "invalid_observed_at", "observed_at")
     try:
-        moment = datetime.fromisoformat(observed)
+        moment = datetime.fromisoformat(normalize_iso8601(observed))
     except ValueError:
         raise Rejected(400, "invalid_observed_at", "observed_at")
     if moment.tzinfo is None:
