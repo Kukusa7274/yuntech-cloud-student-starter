@@ -50,6 +50,19 @@ def build_client(role, code):
     return client, endpoint
 
 
+def reason_code_value(value):
+    if value is None:
+        return 0
+    if isinstance(value, int):
+        return value
+    if hasattr(value, "value"):
+        return int(value.value)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
 class Runner:
     def __init__(self, role, code, pub_topic=None, sub_topic=None, wait_seconds=5):
         self.role = role
@@ -65,7 +78,7 @@ class Runner:
         self.count = 0
 
     def on_connect(self, client, userdata, flags, reason_code, properties=None):
-        print(f"connack={reason_code}", flush=True)
+        print(f"connack={reason_code_value(reason_code)}", flush=True)
         if self.sub_topic:
             client.subscribe(self.sub_topic, qos=1)
         if self.pub_topic:
@@ -77,11 +90,11 @@ class Runner:
             code = reason_codes[0] if reason_codes else 0
         else:
             code = reason_codes
-        print(f"suback={code}", flush=True)
+        print(f"suback={reason_code_value(code)}", flush=True)
 
-    def on_publish(self, client, userdata, mid):
+    def on_publish(self, client, userdata, mid, reason_code, properties=None):
         self.count += 1
-        print(f"puback=0", flush=True)
+        print(f"puback={reason_code_value(reason_code)}", flush=True)
 
     def on_message(self, client, userdata, message):
         payload = message.payload.decode("utf-8", errors="replace")

@@ -31,9 +31,10 @@ def validate(run):
 def make_events(code, run):
     prefix = f"{code}-{run}"
     events = []
-    for device in [f"{code}-d{n:02d}" for n in range(1, 11)]:
+    for device_index in range(1, 11):
+        device = f"{code}-d{device_index:02d}"
         for index in range(1, 4):
-            event_id = f"{prefix}-{device}-{index:02d}"
+            event_id = f"{prefix}-d{device_index:02d}-{index:02d}"
             events.append({
                 "event_id": event_id,
                 "device_id": device,
@@ -42,7 +43,7 @@ def make_events(code, run):
             })
     events.append(events[0].copy())
     events.append({
-        "event_id": f"{prefix}-{code}-d99-01",
+        "event_id": f"{prefix}-d99-01",
         "device_id": f"{code}-d99",
         "observed_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
         "type": "status",
@@ -68,13 +69,13 @@ def connect_client(code):
 class Publisher:
     def __init__(self, code, run):
         self.code = code
-        self.run = run
+        self.run_name = run
         self.prefix, self.events = make_events(code, run)
         self.client, self.endpoint = connect_client(code)
         self.published = 0
         self.client.on_publish = self.on_publish
 
-    def on_publish(self, client, userdata, mid):
+    def on_publish(self, client, userdata, mid, reason_code, properties):
         self.published += 1
 
     def run(self):
@@ -90,7 +91,7 @@ class Publisher:
             self.client.loop_stop()
             self.client.disconnect()
         LAST_RUN.parent.mkdir(parents=True, exist_ok=True)
-        LAST_RUN.write_text(json.dumps({"code": self.code, "run": self.run, "prefix": self.prefix,
+        LAST_RUN.write_text(json.dumps({"code": self.code, "run": self.run_name, "prefix": self.prefix,
                                        "puback_ok": self.published}, indent=2), encoding="utf-8")
         print(f"puback_ok={self.published}/32")
 
